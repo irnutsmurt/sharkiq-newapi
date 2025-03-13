@@ -3,11 +3,12 @@ SharkNinja Identity Provider (IDP) API client.
 
 This replaces the Ayla Networks authentication previously used by SharkIQ devices.
 """
-
 import aiohttp
 import requests
 from datetime import datetime, timedelta
 from typing import Dict, Optional
+from .auth0_client import get_shark_token
+from typing import Dict, Optional, List
 
 from .exc import SharkIqAuthError, SharkIqAuthExpiringError, SharkIqNotAuthedError
 from .const import (
@@ -60,8 +61,10 @@ class SharkAuthClient:
         return {
             "email": self._email,
             "password": self._password,
-            "client_id": self._app_id,
-            "client_secret": self._app_secret
+            "app_type": "android",
+            "app_version": "3.0.0"
+#            "client_id": self._app_id,
+#            "client_secret": self._app_secret
         }
 
     def _set_credentials(self, status_code: int, login_result: Dict):
@@ -88,17 +91,24 @@ class SharkAuthClient:
             raise SharkIqAuthError(f"Missing expected field in authentication response: {e}")
 
     def sign_in(self):
-        """Authenticate to SharkNinja IDP synchronously"""
-        login_data = self._login_data
-        resp = requests.post(self._auth_url, json=login_data)
-        self._set_credentials(resp.status_code, resp.json())
+        """Authenticate to SharkNinja using Auth0"""
+        try:
+            result = get_shark_token(self._email, self._password)
+            # Set credentials using the returned token
+            self._set_credentials(200, result)
+        except Exception as e:
+            raise SharkIqAuthError(f"Authentication failed: {e}")
 
     async def async_sign_in(self):
-        """Authenticate to SharkNinja IDP asynchronously"""
-        session = await self.ensure_session()
-        login_data = self._login_data
-        async with session.post(self._auth_url, json=login_data) as resp:
-            self._set_credentials(resp.status, await resp.json())
+        """Authenticate to SharkNinja using Auth0 asynchronously"""
+        # For async, we'll run the synchronous method in a separate thread
+        import asyncio
+        loop = asyncio.get_event_loop()
+        try:
+            result = await loop.run_in_executor(None, lambda: get_shark_token(self._email, self._password))
+            self._set_credentials(200, result)
+        except Exception as e:
+            raise SharkIqAuthError(f"Authentication failed: {e}")
 
     def refresh_auth(self):
         """Refresh authentication synchronously"""
@@ -113,19 +123,22 @@ class SharkAuthClient:
         resp = requests.post(refresh_url, json=refresh_data)
         self._set_credentials(resp.status_code, resp.json())
 
-    async def async_refresh_auth(self):
-        """Refresh authentication asynchronously"""
-        if not self._refresh_token:
-            # If no refresh token available, perform a full sign-in
-            await self.async_sign_in()
-            return
-
+    async def async_sign_in(self):
+        """Authenticate to SharkNinja IDP asynchronously"""
         session = await self.ensure_session()
-        refresh_data = {"refresh_token": self._refresh_token}
-        # Note: Adjust the refresh endpoint URL as needed
-        refresh_url = f"{self._auth_url}/refresh"
-        async with session.post(refresh_url, json=refresh_data) as resp:
-            self._set_credentials(resp.status, await resp.json())
+        login_data = self._login_data
+        print(f"Trying to authenticate with: {self._auth_url}")
+        print(f"Login data: {login_data}")
+        async with session.post(self._auth_url, json=login_data) as resp:
+            response_text = await resp.text()
+            print(f"Response status: {resp.status}")
+            print(f"Response: {response_text}")
+            try:
+                response_json = await resp.json()
+                self._set_credentials(resp.status, response_json)
+            except Exception as e:
+                print(f"Error parsing response: {e}")
+                raise
 
     def _clear_auth(self):
         """Clear authentication state"""
@@ -210,26 +223,56 @@ class SharkAuthClient:
         headers = self._get_headers(kwargs)
         return session.request(http_method, url, headers=headers, **kwargs)
 
-    def list_devices(self) -> list:
-        """List devices associated with the account"""
-        # The endpoint might be different in the new API
+def list_devices(self) -> List[Dict]:
+    """List devices associated with the account"""
+    # Try the SharkNinja API endpoint
+    device_url = f"https://idp.iot-sharkninja.com/v1/robots"
+
+    headers = {"Authorization": f"Bearer {self._access_token}"}
+    try:
+        resp = requests.get(device_url, headers=headers)
+
+        if resp.status_code == 200:
+            return resp.json()
+        else:
+            # Fall back to Ayla API
+            print(f"Failed to list devices with SharkNinja API: {resp.status_code}")
+            device_url = f"{self._device_url}/apiv1/devices.json"
+            resp = self.request("get", device_url)
+            return [d["device"] for d in resp.json()]
+    except Exception as e:
+        print(f"Error listing devices: {e}")
+        # Fall back to Ayla API
         device_url = f"{self._device_url}/apiv1/devices.json"
         resp = self.request("get", device_url)
-        devices = resp.json()
-        if resp.status_code == 401:
-            raise SharkIqAuthError("Authentication failed when listing devices")
-        return [d["device"] for d in devices]
+        return [d["device"] for d in resp.json()]
 
-    async def async_list_devices(self) -> list:
-        """List devices associated with the account asynchronously"""
-        # The endpoint might be different in the new API
+async def async_list_devices(self) -> List[Dict]:
+    """List devices associated with the account asynchronously"""
+    # Try the SharkNinja API endpoint
+    device_url = f"https://idp.iot-sharkninja.com/v1/robots"
+
+    session = await self.ensure_session()
+    headers = {"Authorization": f"Bearer {self._access_token}"}
+
+    try:
+        async with session.get(device_url, headers=headers) as resp:
+            if resp.status == 200:
+                return await resp.json()
+            else:
+                print(f"Failed to list devices with SharkNinja API: {resp.status}")
+                # Fall back to Ayla API
+                device_url = f"{self._device_url}/apiv1/devices.json"
+                async with await self.async_request("get", device_url) as resp:
+                    devices = await resp.json()
+                return [d["device"] for d in devices]
+    except Exception as e:
+        print(f"Error listing devices: {e}")
+        # Fall back to Ayla API
         device_url = f"{self._device_url}/apiv1/devices.json"
         async with await self.async_request("get", device_url) as resp:
             devices = await resp.json()
-            if resp.status == 401:
-                raise SharkIqAuthError("Authentication failed when listing devices")
         return [d["device"] for d in devices]
-
 
 def get_shark_auth_client(username: str, password: str, websession: Optional[aiohttp.ClientSession] = None, europe: bool = False):
     """Get a SharkAuthClient object"""
